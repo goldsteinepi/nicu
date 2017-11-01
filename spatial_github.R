@@ -15,6 +15,7 @@ library(maptools) #mapping
 library(RColorBrewer) #color palette
 library(spdep) #spatial modeling
 library(boot) #bootstrapping
+library(RODBC) #connect to SQL Server
 
 #returns the MOR from a glmer model, see: http://www.ncbi.nlm.nih.gov/pubmed/16537344
 bootMOR = function(model)
@@ -26,7 +27,7 @@ bootMOR = function(model)
 ### READ DATA ###
 
 #ET cultures: 2006-2015 intubated infants with at least one ETT culture performed
-load("et_data.RData")
+load("et_data_sepsis.RData")
 ET_cultures = NICU
 rm(Vent4plus,Vent6plus,Vent8plus)
 
@@ -34,7 +35,9 @@ rm(Vent4plus,Vent6plus,Vent8plus)
 load("NICU.2016-11-18.RData")
 
 #read NICU map, see http://www.goldsteinepi.com/blog/creatingyourownspatialanalysismapsasshapefileswithqgis
-NICU_map = readShapePoly("NICU", proj4string=CRS("+proj=tmerc +lat_0=38 +lon_0=-75.41666666666667 +k=0.999995 +x_0=200000.0001016002 +y_0=0 +ellps=GRS80 +datum=NAD83 +to_meter=0.3048006096012192 +no_defs"))
+NICU_map = readShapePoly("Shapefiles/NICU", proj4string=CRS("+proj=tmerc +lat_0=38 +lon_0=-75.41666666666667 +k=0.999995 +x_0=200000.0001016002 +y_0=0 +ellps=GRS80 +datum=NAD83 +to_meter=0.3048006096012192 +no_defs"))
+
+#MRN and DOB are added from external data but redacted from this code
 
 
 ### SUBSET and CREATE COHORT ###
@@ -54,11 +57,18 @@ NICU = NICU[NICU$Admission_n==1, ]
 #late onset sepsis
 NICU$Sepsis_late = ifelse(!is.na(NICU$Sepsis_onset) & NICU$Sepsis_onset==1, 1, 0)
 
+#MRSA colonization
+set.seed(777)
+NICU$MRSA_colonization_09 = ifelse((NICU$MRSA_colonization==0) & (runif(nrow(NICU), min=0, max=1)<rep((0.009 - sum(NICU$MRSA_colonization)/nrow(NICU)),nrow(NICU))), 1, NICU$MRSA_colonization)
+NICU$MRSA_colonization_15 = ifelse((NICU$MRSA_colonization==0) & (runif(nrow(NICU), min=0, max=1)<rep((0.015 - sum(NICU$MRSA_colonization)/nrow(NICU)),nrow(NICU))), 1, NICU$MRSA_colonization)
+NICU$MRSA_colonization_22 = ifelse((NICU$MRSA_colonization==0) & (runif(nrow(NICU), min=0, max=1)<rep((0.022 - sum(NICU$MRSA_colonization)/nrow(NICU)),nrow(NICU))), 1, NICU$MRSA_colonization)
+
 #mean center
 NICU$Admission_year_centered = scale(NICU$Admission_year, center=T, scale=F)
 NICU$Gestational_age_centered = scale(NICU$Gestational_age, center=T, scale=F)
 NICU$Birthweight_centered = scale(NICU$Birthweight, center=T, scale=F)
 NICU$LOS_centered = scale(NICU$Birthweight, center=T, scale=F)
+NICU$Census_average_centered = scale(NICU$Census_average, center=T, scale=F)
 
 #bed location to mapping location
 NICU$Location_map = ifelse(NICU$Location=="201A" | NICU$Location=="201B" | NICU$Location=="201C", "201", NICU$Location)
@@ -113,6 +123,8 @@ ET_cultures$Location_map = ifelse(ET_cultures$Location=="224A" | ET_cultures$Loc
 ET_cultures$Location_map = ifelse(ET_cultures$Location=="225A" | ET_cultures$Location=="225B" | ET_cultures$Location=="225C", "225", ET_cultures$Location_map)
 
 #add outcome and covariate data
+NICU$Vent_start_day = NA
+NICU$Vent_culture = NA
 NICU$Pseudomonas_colonization = NA
 NICU$Klebsiella_colonization = NA
 NICU$Location_map_single = NA
@@ -123,25 +135,57 @@ NICU$Location_carpet = NA
 NICU$Location_refrigerator = NA
 NICU$Infection_policy = NA
 
+#add MRN to NICU data
+NICU$MRN = MRNlist$MRN[which(MRNlist$ID %in% NICU$ID)]
+
+#add DOB to NICU data
+NICU$DOB = as.Date(DOBlist$DateOfBirth[which(DOBlist$ID %in% NICU$MRN)])
+
 for (i in 1:nrow(NICU))
 {
   cat("\n\n************** ","Observation: ",i," **************\n",sep="")
   
+  #vent cultures performed
+  
+  if (NICU$Vent[i]==1) {
+    #day of week vent started
+    NICU$Vent_start_day[i] = weekdays(NICU$DOB[i]+NICU$Vent_start[i])
+    
+    #check if intubated on a Monday (when respiratory cultures are taken)
+    if (NICU$Vent_start_day[i]=="Sunday" && NICU$Vent_length[i]>=1) {
+      NICU$Vent_culture[i] = 1
+    } else if (NICU$Vent_start_day[i]=="Monday" && NICU$Vent_length[i]>=7) {
+      NICU$Vent_culture[i] = 1
+    } else if (NICU$Vent_start_day[i]=="Tuesday" && NICU$Vent_length[i]>=6) {
+      NICU$Vent_culture[i] = 1
+    } else if (NICU$Vent_start_day[i]=="Wednesday" && NICU$Vent_length[i]>=5) {
+      NICU$Vent_culture[i] = 1
+    } else if (NICU$Vent_start_day[i]=="Thursday" && NICU$Vent_length[i]>=4) {
+      NICU$Vent_culture[i] = 1
+    } else if (NICU$Vent_start_day[i]=="Friday" && NICU$Vent_length[i]>=3) {
+      NICU$Vent_culture[i] = 1
+    } else if (NICU$Vent_start_day[i]=="Saturday" && NICU$Vent_length[i]>=2) {
+      NICU$Vent_culture[i] = 1
+    } else {
+      NICU$Vent_culture[i] = 0
+    }
+  }
+  
   #pseudomonas
-  NICU$Pseudomonas_colonization[i] = ifelse(length(grep("Pseudomonas", ET_cultures$Vent_culture_organisms[ET_cultures$ID==NICU$ID[i]]))>0, 1, ifelse(NICU$Vent[i]==1, 0, NA))
+  NICU$Pseudomonas_colonization[i] = ifelse(length(grep("Pseudomonas", ET_cultures$Vent_culture_organisms[ET_cultures$ID==NICU$ID[i]]))>0, 1, ifelse(NICU$Vent_culture[i]==1, 0, NA))
   
   #klebseilla
-  NICU$Klebsiella_colonization[i] = ifelse(length(grep("Klebsiella", ET_cultures$Vent_culture_organisms[ET_cultures$ID==NICU$ID[i]]))>0, 1, ifelse(NICU$Vent[i]==1, 0, NA))
+  NICU$Klebsiella_colonization[i] = ifelse(length(grep("Klebsiella", ET_cultures$Vent_culture_organisms[ET_cultures$ID==NICU$ID[i]]))>0, 1, ifelse(NICU$Vent_culture[i]==1, 0, NA))
   
   #single patient rooms
   NICU$Location_map_single[i] = ifelse(NICU$Location_map[i]=="208A" | NICU$Location_map[i]=="208B" | NICU$Location_map[i]=="210A" | NICU$Location_map[i]=="210B" | NICU$Location_map[i]=="217" | NICU$Location_map[i]=="216A" | NICU$Location_map[i]=="216B" | NICU$Location_map[i]=="220", 1, 0)
   
   #patient rooms where more equipment can fit
   NICU$Location_equipment[i] = ifelse(NICU$Location_map[i]=="208A" | NICU$Location_map[i]=="209" | NICU$Location_map[i]=="217" | NICU$Location_map[i]=="216A" | NICU$Location_map[i]=="216B" | NICU$Location_map[i]=="220", 1, 0)
-
+  
   #universal gloving: based on dates from Deb Tuttle
   NICU$Gloving[i] = ifelse((NICU$Date_admission[i]>=as.Date("2008-08-18") & NICU$Date_discharge_initial[i]<=as.Date("2010-02-28")) | (NICU$Date_admission[i]>=as.Date("2012-10-01") & NICU$Date_discharge_initial[i]<=as.Date("2013-10-15")), 1, 0)
-
+  
   #leaking ceiling tile/pseudomonas
   NICU$Location_ceiling_tile[i] = ifelse(NICU$Date_admission[i]>=as.Date("2006-05-01") & NICU$Date_admission[i]<=as.Date("2006-05-10") & NICU$Location_map[i]=="207", 1, 0)
   
@@ -150,11 +194,14 @@ for (i in 1:nrow(NICU))
   
   #refrigerator
   NICU$Location_refrigerator[i] = ifelse(NICU$Location_map[i]=="208B" | NICU$Location_map[i]=="216B" | NICU$Location_map[i]=="220", 1, 0)
-
+  
   #unit specific infection policy
   NICU$Infection_policy[i] = ifelse(NICU$Date_admission[i]>=as.Date("2013-03-01"), 1, 0)
 }
-rm(i)
+rm(i,MRNlist,DOBlist)
+NICU$MRN = NULL
+NICU$DOB = NULL
+rownames(NICU) = NULL
 
 #indicators and outcomes in the ecological data
 map_data=data.frame("bed"=as.character(slot(NICU_map, "data")$bed), "MRSA_colonization"=NA, "RSV"=NA, "Sepsis_late"=NA, "Pseudomonas_colonization"=NA, "Klebsiella_colonization"=NA, "Location_equipment"=NA, stringsAsFactors=F)
@@ -168,12 +215,16 @@ for (i in 1:nrow(map_data))
   map_data$Klebsiella_colonization[i] = length(grep("Klebsiella", ET_cultures$Vent_culture_organisms[ET_cultures$Location_map==map_data$bed[i]]))
   map_data$Location_equipment[i] = ifelse(map_data$bed[i]=="208A" | map_data$bed[i]=="209" | map_data$bed[i]=="217" | map_data$bed[i]=="216A" | map_data$bed[i]=="216B" | map_data$bed[i]=="220", 1, 0)
 }
-rm(i)
+rm(i,ET_cultures)
 
 #merge the indicator dataframe to the shapefile, note we do not sort data to preserve the order of the polygons 
 #NICU_map@data = merge(x=NICU_map@data, y=map_data, by="bed", all.x=T, sort=F)
 NICU_map = merge(x=NICU_map, y=map_data, by="bed", all.x=T)
 rm(map_data)
+
+#save data
+save.image("spatial.RData")
+#load("spatial.RData")
 
 
 ### ANALYSIS INDIVIDUAL LEVEL VARS ###
@@ -181,17 +232,33 @@ rm(map_data)
 CrossTable(NICU$MRSA_colonization)
 #CrossTable(NICU$RSV)
 CrossTable(NICU$Sepsis_late)
+
 CrossTable(NICU$Vent)
+CrossTable(NICU$Vent_culture)
 CrossTable(NICU$Pseudomonas_colonization)
 CrossTable(NICU$Klebsiella_colonization)
 
-describe(NICU$Gestational_age[NICU$Vent==1])
-CrossTable(NICU$Central_line[NICU$Vent==1])
-CrossTable(NICU$Antibiotic[NICU$Vent==1])
-CrossTable(NICU$PROM[NICU$Vent==1])
-CrossTable(NICU$Chorio_clinical[NICU$Vent==1])
-CrossTable(NICU$Mom_antibiotic[NICU$Vent==1])
-           
+describe(NICU$Gestational_age); IQR(NICU$Gestational_age,na.rm=T)
+describe(NICU$Birthweight)
+CrossTable(NICU$Central_line)
+CrossTable(NICU$Antibiotic)
+CrossTable(NICU$PROM)
+CrossTable(NICU$Chorio_clinical)
+CrossTable(NICU$Mom_antibiotic)
+CrossTable(NICU$Outborn)
+describe(NICU$Census_average)
+
+describe(NICU$Gestational_age[NICU$Vent_culture==1]); IQR(NICU$Gestational_age[NICU$Vent_culture==1],na.rm=T)
+describe(NICU$Birthweight[NICU$Vent_culture==1])
+CrossTable(NICU$Central_line[NICU$Vent_culture==1])
+CrossTable(NICU$Antibiotic[NICU$Vent_culture==1])
+CrossTable(NICU$PROM[NICU$Vent_culture==1])
+CrossTable(NICU$Chorio_clinical[NICU$Vent_culture==1])
+CrossTable(NICU$Mom_antibiotic[NICU$Vent_culture==1])
+CrossTable(NICU$Outborn[NICU$Vent_culture==1])
+describe(NICU$Census_average[NICU$Vent_culture==1])
+describe(NICU$Vent_length[NICU$Vent_culture==1]); IQR(NICU$Vent_length[NICU$Vent_culture==1],na.rm=T)
+
 describeBy(NICU$Admission_year, NICU$MRSA_colonization); t.test(NICU$Admission_year ~ NICU$MRSA_colonization)
 describeBy(NICU$Gestational_age, NICU$MRSA_colonization); t.test(NICU$Gestational_age ~ NICU$MRSA_colonization)
 describeBy(NICU$Birthweight, NICU$MRSA_colonization); wilcox.test(NICU$Birthweight ~ NICU$MRSA_colonization)
@@ -204,6 +271,7 @@ CrossTable(NICU$Antibiotic, NICU$MRSA_colonization, prop.r=F, prop.t=F, prop.chi
 CrossTable(NICU$PROM, NICU$MRSA_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Chorio_clinical, NICU$MRSA_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Mom_antibiotic, NICU$MRSA_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
+describeBy(NICU$Census_average, NICU$MRSA_colonization); wilcox.test(NICU$Census_average ~ NICU$MRSA_colonization)
 
 # CrossTable(NICU$Admission_year, NICU$RSV, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 # describeBy(NICU$Gestational_age, NICU$RSV); t.test(NICU$Gestational_age ~ NICU$RSV)
@@ -230,6 +298,7 @@ CrossTable(NICU$Antibiotic, NICU$Sepsis_late, prop.r=F, prop.t=F, prop.chisq=F, 
 CrossTable(NICU$PROM, NICU$Sepsis_late, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Chorio_clinical, NICU$Sepsis_late, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Mom_antibiotic, NICU$Sepsis_late, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
+describeBy(NICU$Census_average, NICU$Sepsis_late); wilcox.test(NICU$Census_average ~ NICU$Sepsis_late)
 
 CrossTable(NICU$Admission_year, NICU$Pseudomonas_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 describeBy(NICU$Gestational_age, NICU$Pseudomonas_colonization); t.test(NICU$Gestational_age ~ NICU$Pseudomonas_colonization)
@@ -243,6 +312,7 @@ CrossTable(NICU$Antibiotic, NICU$Pseudomonas_colonization, prop.r=F, prop.t=F, p
 CrossTable(NICU$PROM, NICU$Pseudomonas_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Chorio_clinical, NICU$Pseudomonas_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Mom_antibiotic, NICU$Pseudomonas_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
+describeBy(NICU$Census_average, NICU$Pseudomonas_colonization); wilcox.test(NICU$Census_average ~ NICU$Pseudomonas_colonization)
 
 CrossTable(NICU$Admission_year, NICU$Klebsiella_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 describeBy(NICU$Gestational_age, NICU$Klebsiella_colonization); t.test(NICU$Gestational_age ~ NICU$Klebsiella_colonization)
@@ -256,9 +326,18 @@ CrossTable(NICU$Antibiotic, NICU$Klebsiella_colonization, prop.r=F, prop.t=F, pr
 CrossTable(NICU$PROM, NICU$Klebsiella_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Chorio_clinical, NICU$Klebsiella_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
 CrossTable(NICU$Mom_antibiotic, NICU$Klebsiella_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=T)
+describeBy(NICU$Census_average, NICU$Klebsiella_colonization); wilcox.test(NICU$Census_average ~ NICU$Klebsiella_colonization)
 
 
 ### ANALYSIS ENVIRONMENTAL VARS ###
+
+CrossTable(NICU$Location_map_single)
+CrossTable(NICU$Location_equipment)
+CrossTable(NICU$Location_refrigerator)
+
+CrossTable(NICU$Location_map_single[NICU$Vent_culture==1])
+CrossTable(NICU$Location_equipment[NICU$Vent_culture==1])
+CrossTable(NICU$Location_refrigerator[NICU$Vent_culture==1])
 
 CrossTable(NICU$Location_map_single, NICU$MRSA_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=F); summary(glmer(MRSA_colonization ~ (1 | Location_map) + Location_map_single, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa")))
 CrossTable(NICU$Location_equipment, NICU$MRSA_colonization, prop.r=F, prop.t=F, prop.chisq=F, chisq=F); summary(glmer(MRSA_colonization ~ (1 | Location_map) + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa")))
@@ -384,14 +463,24 @@ exp(confint.merMod(model, method="Wald"))
 
 ## INDIVIDUAL+ENVIRONMENTAL MODELS
 
-model = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
-#model = bglmer(RSV ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
-model = bglmer(Sepsis_late ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
-model = bglmer(Pseudomonas_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
-model = bglmer(Klebsiella_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+#model = bglmer(RSV ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model = bglmer(Sepsis_late ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model = bglmer(Pseudomonas_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model = bglmer(Klebsiella_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
 
 #ETT colonization models have random effect variances estimated as zero, see this discussion: http://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#singular-models-random-effect-variances-estimated-as-zero-or-correlations-estimated-as---1 
 #using Bayesian linear mixed effect models to estimate random variance
+
+#sensitivity analyses
+model = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU[NICU$Admission_year>=2013,], control=glmerControl(optimizer="bobyqa"))
+model = bglmer(MRSA_colonization_09 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model = bglmer(MRSA_colonization_15 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model = bglmer(MRSA_colonization_22 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU[NICU$Outborn==0,], control=glmerControl(optimizer="bobyqa"))
+model = bglmer(Sepsis_late ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU[NICU$Outborn==0,], control=glmerControl(optimizer="bobyqa"))
+model = bglmer(Pseudomonas_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU[NICU$Outborn==0,], control=glmerControl(optimizer="bobyqa"))
+model = bglmer(Klebsiella_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU[NICU$Outborn==0,], control=glmerControl(optimizer="bobyqa"))
 
 #OR and CI estimates for fixed effects
 summary(model)
@@ -405,8 +494,30 @@ getME(model,"theta")
 exp(0.95*getME(model,"theta"))
 
 #bootstrap precision around MOR
-boot_model = bootMer(model, bootMOR, nsim=1000, parallel="multicore", ncpus=4)
-boot.ci(boot_model, type="norm", index=1)
+set.seed(777)
+NICU_boot = NICU
+#NICU_boot = NICU[NICU$Outborn==0,]
+#NICU_boot = NICU[NICU$Admission_year>=2013,]
+#NICU_boot = NICU[!is.na(NICU$Vent_culture) & NICU$Vent_culture==1, ]
+MOR = NA
+for (i in 1:1000)
+{
+  cat("\n\n************** ","Observation: ",i," **************\n",sep="")
+  
+  bootindex = sample(nrow(NICU_boot), nrow(NICU_boot), replace=T)
+  bootdata = NICU_boot[bootindex,]
+  #model = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=bootdata, control=glmerControl(optimizer="bobyqa"))
+  #model = bglmer(MRSA_colonization_09 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=bootdata, control=glmerControl(optimizer="bobyqa"))
+  model = bglmer(MRSA_colonization_15 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=bootdata, control=glmerControl(optimizer="bobyqa"))
+  #model = bglmer(MRSA_colonization_22 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=bootdata, control=glmerControl(optimizer="bobyqa"))
+  #model = bglmer(Sepsis_late ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=bootdata, control=glmerControl(optimizer="bobyqa"))
+  #model = bglmer(Pseudomonas_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=bootdata, control=glmerControl(optimizer="bobyqa"))
+  #model = bglmer(Klebsiella_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + log(Vent_length) + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=bootdata, control=glmerControl(optimizer="bobyqa"))
+  MOR = c(MOR, exp(0.95*getME(model,"theta")))
+}
+rm(i,NICU_boot,bootindex,bootdata)
+MOR = MOR[-1]
+quantile(MOR, probs=c(0.025, 0.5, 0.975))
 
 #spatial autocorrelation
 moran.mc(ranef(model)[[1]][[1]], listw=sa.wt, nsim=1000)
@@ -438,12 +549,18 @@ boot.ci(boot_model, type="norm", index=1)
 
 ### SPATIAL MODELING ###
 
+#output to tif for publication 
+tiff("Figure 1d.tif",height=6,width=6,units='in',res=1200) 
+
 #choropleth plots by 5-levels of shading
 spplot(NICU_map, "MRSA_colonization", cuts=4, sp.layout=list("sp.text", coordinates(NICU_map), NICU_map$bed), col.regions=brewer.pal(5, "Reds"))
 #spplot(NICU_map, "RSV", cuts=4, sp.layout=list("sp.text", coordinates(NICU_map), NICU_map$bed), col.regions=brewer.pal(5, "Reds"))
 spplot(NICU_map, "Sepsis_late", cuts=4, sp.layout=list("sp.text", coordinates(NICU_map), NICU_map$bed), col.regions=brewer.pal(5, "Reds"))
 spplot(NICU_map, "Pseudomonas_colonization", cuts=4, sp.layout=list("sp.text", coordinates(NICU_map), NICU_map$bed), col.regions=brewer.pal(5, "Reds"))
 spplot(NICU_map, "Klebsiella_colonization", cuts=4, sp.layout=list("sp.text", coordinates(NICU_map), NICU_map$bed), col.regions=brewer.pal(5, "Reds"))
+
+#close file 
+dev.off() 
 
 #define neighbors based on shared boundary or distance of 10 apart
 sa.nb = poly2nb(NICU_map, queen=T, snap=10)
@@ -520,7 +637,7 @@ NICU$Eigenvector4 = NA
 for (i in 1:nrow(NICU))
 {
   cat("\n\n************** ","Observation: ",i," **************\n",sep="")
-
+  
   NICU$Eigenvector1[i] = ifelse(!is.na(NICU$Location_map[i]), fitted(spatial_eigen)[which(slot(NICU_map, "data")$bed==NICU$Location_map[i]), 1], NA)
   NICU$Eigenvector2[i] = ifelse(!is.na(NICU$Location_map[i]), fitted(spatial_eigen)[which(slot(NICU_map, "data")$bed==NICU$Location_map[i]), 2], NA)
   NICU$Eigenvector3[i] = ifelse(!is.na(NICU$Location_map[i]), fitted(spatial_eigen)[which(slot(NICU_map, "data")$bed==NICU$Location_map[i]), 3], NA)
@@ -529,8 +646,15 @@ for (i in 1:nrow(NICU))
 rm(i,spatial_eigen)
 
 #mixed effects spatial model, with eigenvectors as random effects
-model_nospatial = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
-model_spatial = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment + Eigenvector1 + Eigenvector2 + Eigenvector3 + Eigenvector4, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model_nospatial = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model_spatial = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Census_average_centered + Location_equipment + Eigenvector1 + Eigenvector2 + Eigenvector3 + Eigenvector4, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+
+#sensitivity analyses
+model_spatial = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment + Eigenvector1 + Eigenvector2 + Eigenvector3 + Eigenvector4, family=binomial(), data=NICU[NICU$Admission_year>=2013,], control=glmerControl(optimizer="bobyqa"))
+model_spatial = bglmer(MRSA_colonization_09 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment + Eigenvector1 + Eigenvector2 + Eigenvector3 + Eigenvector4, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model_spatial = bglmer(MRSA_colonization_15 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment + Eigenvector1 + Eigenvector2 + Eigenvector3 + Eigenvector4, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model_spatial = bglmer(MRSA_colonization_22 ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment + Eigenvector1 + Eigenvector2 + Eigenvector3 + Eigenvector4, family=binomial(), data=NICU, control=glmerControl(optimizer="bobyqa"))
+model_spatial = bglmer(MRSA_colonization ~ (1 | Location_map) + Admission_year_centered + Gestational_age_centered + Central_line + Antibiotic + PROM + Chorio_clinical + Location_equipment + Eigenvector1 + Eigenvector2 + Eigenvector3 + Eigenvector4, family=binomial(), data=NICU[NICU$Outborn==0,], control=glmerControl(optimizer="bobyqa"))
 
 #compare models
 summary(model_nospatial)
